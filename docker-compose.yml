@@ -1,0 +1,15 @@
+services:
+  klasnovtg:
+    build: .
+    container_name: klasnovtg
+    restart: unless-stopped
+    volumes:
+      # Пробрасываем .env и базу данных, чтобы сохранять состояние при пересборке
+      - ./.env:/app/.env:ro
+      - ./bot.db:/app/bot.db
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
