@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 import re
 import time
@@ -173,9 +174,9 @@ class JournalClient:
             start = item.get("started_at", "")
             end = item.get("finished_at", "")
             time_str = f"{start} - {end}" if start and end else ""
-            subj = item.get("subject_name") or "Пара"
-            room = format_room(item.get("room_name") or "")
-            teacher = format_teacher_name(item.get("teacher_name") or "")
+            subj = html.escape(item.get("subject_name") or "Пара")
+            room = html.escape(format_room(item.get("room_name") or ""))
+            teacher = html.escape(format_teacher_name(item.get("teacher_name") or ""))
 
             line = f"<b>{num}.</b> <code>{time_str}</code> · <b>{subj}</b>"
 

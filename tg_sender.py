@@ -215,28 +215,49 @@ class TelegramSender:
             "photo": photo_url,
         }
         if caption:
-            # Для caption лимит 1024 символа
+            # Для caption лимит 1024 символа; при обрезке удаляем HTML-теги во избежание обрыва разметки
             if len(caption) > 1000:
-                caption = caption[:997] + "..."
-            payload["caption"] = caption
-            payload["parse_mode"] = "HTML"
+                clean_cap = re.sub(r"<[^>]+>", "", caption)
+                caption = (clean_cap[:997] + "...") if len(clean_cap) > 1000 else clean_cap
+                payload["caption"] = caption
+                payload.pop("parse_mode", None)
+            else:
+                payload["caption"] = caption
+                payload["parse_mode"] = "HTML"
 
         try:
             resp = await self._client.post(f"{self.api_url}/sendPhoto", json=payload)
             if resp.status_code == 200:
                 return True
-            else:
-                logger.warning("Не удалось отправить фото по URL: %s. Пробуем скачать и отправить файлом...", resp.text)
-                # Скачиваем фото и шлём multipart
-                download_resp = await self._client.get(photo_url)
-                if download_resp.status_code == 200:
-                    files = {"photo": ("image.jpg", download_resp.content, "image/jpeg")}
-                    data = {"chat_id": self.chat_id}
-                    if caption:
-                        data["caption"] = caption
-                        data["parse_mode"] = "HTML"
+
+            if "can't parse entities" in resp.text:
+                payload.pop("parse_mode", None)
+                payload["caption"] = re.sub(r"<[^>]+>", "", caption)[:1000]
+                resp = await self._client.post(f"{self.api_url}/sendPhoto", json=payload)
+                if resp.status_code == 200:
+                    return True
+
+            logger.warning("Не удалось отправить фото по URL: %s. Пробуем скачать и отправить файлом...", resp.text)
+            # Валидация схемы URL для защиты от SSRF
+            if not photo_url.lower().startswith("https://"):
+                logger.error("Недопустимый протокол URL для скачивания: %s", photo_url)
+                return False
+
+            # Скачиваем фото и шлём multipart
+            download_resp = await self._client.get(photo_url)
+            if download_resp.status_code == 200:
+                files = {"photo": ("image.jpg", download_resp.content, "image/jpeg")}
+                data = {"chat_id": self.chat_id}
+                if caption:
+                    data["caption"] = caption
+                    if "parse_mode" in payload:
+                        data["parse_mode"] = payload["parse_mode"]
+                resp2 = await self._client.post(f"{self.api_url}/sendPhoto", data=data, files=files)
+                if resp2.status_code != 200 and "can't parse entities" in resp2.text:
+                    data.pop("parse_mode", None)
+                    data["caption"] = re.sub(r"<[^>]+>", "", caption)[:1000]
                     resp2 = await self._client.post(f"{self.api_url}/sendPhoto", data=data, files=files)
-                    return resp2.status_code == 200
+                return resp2.status_code == 200
         except Exception as e:
             logger.error("Исключение при отправке фото в TG: %s", e)
         return False
@@ -248,12 +269,25 @@ class TelegramSender:
             "document": doc_url,
         }
         if caption:
-            payload["caption"] = caption[:1000]
-            payload["parse_mode"] = "HTML"
+            if len(caption) > 1000:
+                clean_cap = re.sub(r"<[^>]+>", "", caption)
+                caption = (clean_cap[:997] + "...") if len(clean_cap) > 1000 else clean_cap
+                payload["caption"] = caption
+                payload.pop("parse_mode", None)
+            else:
+                payload["caption"] = caption
+                payload["parse_mode"] = "HTML"
 
         try:
             resp = await self._client.post(f"{self.api_url}/sendDocument", json=payload)
-            return resp.status_code == 200
+            if resp.status_code == 200:
+                return True
+            if "can't parse entities" in resp.text:
+                payload.pop("parse_mode", None)
+                payload["caption"] = re.sub(r"<[^>]+>", "", caption)[:1000]
+                resp = await self._client.post(f"{self.api_url}/sendDocument", json=payload)
+                return resp.status_code == 200
+            return False
         except Exception as e:
             logger.error("Исключение при отправке документа в TG: %s", e)
             return False
@@ -296,7 +330,8 @@ class TelegramSender:
 
         # Затем отправляем все фото и файлы
         for photo in photos:
-            await self.send_photo(photo["url"], caption=f"📎 Фото: {photo.get('originalName', 'image.jpg')}")
+            photo_name = html.escape(photo.get("originalName") or "image.jpg")
+            await self.send_photo(photo["url"], caption=f"📎 Фото: {photo_name}")
 
         for doc in other_files:
             doc_name = doc.get("originalName") or "file"

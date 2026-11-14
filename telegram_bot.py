@@ -1,8 +1,4 @@
-import logging
-from datetime import datetime, timezone, timedelta, date
-from pathlib import Path
-from typing import Any, Optional
-
+import html
 import logging
 import re
 import time
@@ -50,6 +46,12 @@ class TelegramBotHandler:
     def _check_rate_limit(self, user_id: int, cooldown_seconds: float = 3.0) -> bool:
         """Возвращает True, если лимит превышен (флуд), иначе обновляет время и возвращает False"""
         now = time.time()
+        # Очистка словаря при превышении лимита размера во избежание утечки памяти
+        if len(self._user_last_msg_time) > 1000:
+            cutoff = now - 300.0  # старше 5 минут
+            self._user_last_msg_time = {
+                uid: ts for uid, ts in self._user_last_msg_time.items() if ts > cutoff
+            }
         last_time = self._user_last_msg_time.get(user_id, 0.0)
         if now - last_time < cooldown_seconds:
             return True
@@ -118,10 +120,11 @@ class TelegramBotHandler:
                     if req_status == "blocked":
                         continue
 
+                    safe_user_name = html.escape(user_name or "пользователь")
                     # Отправляем сообщение пользователю
                     await self.tg.send_text(
                         f"⛔ <b>Доступ ограничен</b>\n\n"
-                        f"Привет, {user_name or 'пользователь'}!\n"
+                        f"Привет, {safe_user_name}!\n"
                         f"Вы не добавлены в вайтлист.\n"
                         f"Ваш Telegram ID: <code>{user_id}</code>\n\n"
                         f"Для добавления в вайтлист напишите: @vvoid",
@@ -137,7 +140,7 @@ class TelegramBotHandler:
                             "inline_keyboard": [
                                 [
                                     {
-                                        "text": f"✅ Добавить {user_name or user_id}",
+                                        "text": f"✅ Добавить {user_name or user_id}"[:32],
                                         "callback_data": f"wl_accept:{user_id}",
                                     },
                                     {
@@ -153,12 +156,13 @@ class TelegramBotHandler:
                                 ]
                             ]
                         }
-                        u_link = f"@{username}" if username else "нет"
+                        safe_admin_u_name = html.escape(user_name or "Без имени")
+                        safe_admin_u_link = f"@{html.escape(username)}" if username else "нет"
                         for admin_chat in self.admin_ids:
                             await self.tg.send_text(
                                 f"🔔 <b>Запрос доступа к расписанию</b>\n\n"
-                                f"👤 <b>Имя:</b> {user_name or 'Без имени'}\n"
-                                f"🔗 <b>Username:</b> {u_link}\n"
+                                f"👤 <b>Имя:</b> {safe_admin_u_name}\n"
+                                f"🔗 <b>Username:</b> {safe_admin_u_link}\n"
                                 f"🆔 <b>ID:</b> <code>{user_id}</code>",
                                 target_chat_id=admin_chat,
                                 reply_markup=admin_btn,
@@ -188,23 +192,46 @@ class TelegramBotHandler:
         forward_origin = message.get("forward_origin", {})
         target_fwd_user = forward_from or forward_origin.get("sender_user")
 
-        if target_fwd_user and (not text or text.lower().startswith("/wl") or text.lower().startswith("/add")):
+        if target_fwd_user:
             target_id = target_fwd_user.get("id")
             first_name = target_fwd_user.get("first_name", "")
             username = target_fwd_user.get("username", "")
+            raw_display = f"@{username}" if username else first_name or str(target_id)
+            safe_display = html.escape(raw_display)
 
-            self.db.add_to_whitelist(
-                user_id=target_id,
-                username=username,
-                first_name=first_name,
-                added_by=admin_id,
-            )
-            name_display = f"@{username}" if username else first_name or str(target_id)
-            await self.tg.send_text(
-                f"✅ Пользователь <b>{name_display}</b> (ID: <code>{target_id}</code>) успешно добавлен в вайтлист!",
-                target_chat_id=chat_id,
-            )
-            return True
+            if text and (text.lower().startswith("/wl") or text.lower().startswith("/add")):
+                self.db.add_to_whitelist(
+                    user_id=target_id,
+                    username=username,
+                    first_name=first_name,
+                    added_by=admin_id,
+                )
+                await self.tg.send_text(
+                    f"✅ Пользователь <b>{safe_display}</b> (ID: <code>{target_id}</code>) успешно добавлен в вайтлист!",
+                    target_chat_id=chat_id,
+                )
+                return True
+            elif not text:
+                confirm_kb = {
+                    "inline_keyboard": [
+                        [
+                            {
+                                "text": f"✅ Добавить {first_name or target_id}"[:32],
+                                "callback_data": f"wl_accept:{target_id}",
+                            },
+                            {
+                                "text": "🚫 Отмена",
+                                "callback_data": f"wl_cancel:{target_id}",
+                            },
+                        ]
+                    ]
+                }
+                await self.tg.send_text(
+                    f"❓ Добавить пересланного пользователя <b>{safe_display}</b> (ID: <code>{target_id}</code>) в вайтлист?",
+                    target_chat_id=chat_id,
+                    reply_markup=confirm_kb,
+                )
+                return True
 
         if not (text.startswith("/wl") or text.startswith("/whitelist")):
             return False
@@ -227,8 +254,9 @@ class TelegramBotHandler:
                     uid = row["user_id"]
                     uname = f"@{row['username']}" if row.get("username") else ""
                     fname = row.get("first_name") or ""
-                    display = f"{fname} {uname}".strip() or "Без имени"
-                    lines.append(f"{idx}. <b>{display}</b> — <code>{uid}</code>")
+                    raw_display = f"{fname} {uname}".strip() or "Без имени"
+                    safe_display = html.escape(raw_display)
+                    lines.append(f"{idx}. <b>{safe_display}</b> — <code>{uid}</code>")
                 lines.append(
                     "\n<i>Удалить: <code>/wl del &lt;ID&gt;</code>\n"
                     "Добавить: <code>/wl add &lt;ID&gt;</code> или перешлите сообщение.</i>"
@@ -267,9 +295,10 @@ class TelegramBotHandler:
                 added_by=admin_id,
             )
 
-            name_display = f"@{username}" if username else first_name or "без имени"
+            raw_display = f"@{username}" if username else first_name or "без имени"
+            safe_display = html.escape(raw_display)
             await self.tg.send_text(
-                f"✅ Пользователь <b>{name_display}</b> (ID: <code>{target_id}</code>) добавлен в вайтлист!",
+                f"✅ Пользователь <b>{safe_display}</b> (ID: <code>{target_id}</code>) добавлен в вайтлист!",
                 target_chat_id=chat_id,
             )
             return True
@@ -345,7 +374,8 @@ class TelegramBotHandler:
             )
             self.db.record_access_request(target_uid, status="approved")
 
-            name_display = f"@{target_username}" if target_username else target_fname or str(target_uid)
+            raw_display = f"@{target_username}" if target_username else target_fname or str(target_uid)
+            safe_display = html.escape(raw_display)
 
             # Обновляем админское сообщение (убираем кнопку и пишем, что добавлен)
             await self.tg.edit_message_text(
@@ -353,7 +383,7 @@ class TelegramBotHandler:
                 message_id=message_id,
                 text=(
                     f"✅ <b>Доступ предоставлен!</b>\n\n"
-                    f"👤 <b>Пользователь:</b> {name_display}\n"
+                    f"👤 <b>Пользователь:</b> {safe_display}\n"
                     f"🆔 <b>ID:</b> <code>{target_uid}</code>\n"
                     f"Добавлен в вайтлист администратором."
                 ),
@@ -386,14 +416,15 @@ class TelegramBotHandler:
             cached_u = self.db.get_tg_user(target_uid) or {}
             target_username = cached_u.get("username", "")
             target_fname = cached_u.get("first_name", "")
-            name_display = f"@{target_username}" if target_username else target_fname or str(target_uid)
+            raw_display = f"@{target_username}" if target_username else target_fname or str(target_uid)
+            safe_display = html.escape(raw_display)
 
             await self.tg.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
                 text=(
                     f"❌ <b>Запрос отклонён.</b>\n\n"
-                    f"👤 <b>Пользователь:</b> {name_display}\n"
+                    f"👤 <b>Пользователь:</b> {safe_display}\n"
                     f"🆔 <b>ID:</b> <code>{target_uid}</code>\n"
                     f"<i>Запрос сброшен. Если он напишет снова, вам придет новое уведомление.</i>"
                 ),
@@ -415,18 +446,26 @@ class TelegramBotHandler:
             cached_u = self.db.get_tg_user(target_uid) or {}
             target_username = cached_u.get("username", "")
             target_fname = cached_u.get("first_name", "")
-            name_display = f"@{target_username}" if target_username else target_fname or str(target_uid)
+            raw_display = f"@{target_username}" if target_username else target_fname or str(target_uid)
+            safe_display = html.escape(raw_display)
 
             await self.tg.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
                 text=(
                     f"⛔ <b>Пользователь заблокирован!</b>\n\n"
-                    f"👤 <b>Пользователь:</b> {name_display}\n"
+                    f"👤 <b>Пользователь:</b> {safe_display}\n"
                     f"🆔 <b>ID:</b> <code>{target_uid}</code>\n"
                     f"<i>Бот будет полностью игнорировать любые его сообщения.</i>"
                 ),
             )
+            return
+
+        # 0.3 Отмена интерактивного подтверждения добавления
+        if data.startswith("wl_cancel:"):
+            if user_id not in self.admin_ids:
+                return
+            await self.tg.delete_message(chat_id=chat_id, message_id=message_id)
             return
 
         # Проверка доступа к кнопкам расписания
@@ -436,9 +475,10 @@ class TelegramBotHandler:
             if self.db.get_access_request_status(user_id) == "blocked":
                 return
             user_name = from_user.get("first_name", "пользователь")
+            safe_user_name = html.escape(user_name)
             await self.tg.send_text(
                 f"⛔ <b>Доступ ограничен</b>\n\n"
-                f"Привет, {user_name}!\n"
+                f"Привет, {safe_user_name}!\n"
                 f"Вы не добавлены в вайтлист.\n"
                 f"Ваш Telegram ID: <code>{user_id}</code>\n\n"
                 f"Для добавления в вайтлист напишите: @vvoid",
@@ -525,4 +565,6 @@ class TelegramBotHandler:
             reply_markup=inline_kb,
         )
         if new_msg_id:
+            if len(self._last_schedule_msg_id) > 1000:
+                self._last_schedule_msg_id.clear()
             self._last_schedule_msg_id[chat_id] = new_msg_id

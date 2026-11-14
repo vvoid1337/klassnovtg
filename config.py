@@ -17,7 +17,7 @@ class Config:
 
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-    TELEGRAM_ADMIN_IDS_RAW: str = os.getenv("TELEGRAM_ADMIN_IDS", "1236149695").strip()
+    TELEGRAM_ADMIN_IDS_RAW: str = os.getenv("TELEGRAM_ADMIN_IDS", "").strip()
 
     DB_PATH: Path = BASE_DIR / "bot.db"
 
@@ -31,8 +31,6 @@ class Config:
                 part = part.strip()
                 if part.isdigit():
                     ids.add(int(part))
-        # Дефолтный ID админа
-        ids.add(1236149695)
         return ids
 
     @classmethod
