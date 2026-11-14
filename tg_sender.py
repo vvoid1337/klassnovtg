@@ -66,22 +66,35 @@ class TelegramSender:
             logger.error("Ошибка соединения с Telegram API: %s", e)
             return False
 
-    async def send_text(self, text: str, parse_mode: Optional[str] = "HTML") -> bool:
-        """Отправляет текстовое сообщение в беседу (с разбивкой на части при > 4000 символов)"""
-        if not self.chat_id or self.chat_id == "YOUR_TELEGRAM_CHAT_ID":
-            logger.error("TELEGRAM_CHAT_ID не задан в .env!")
-            return False
+    async def send_text(
+        self,
+        text: str,
+        parse_mode: Optional[str] = "HTML",
+        target_chat_id: Optional[str | int] = None,
+        reply_markup: Optional[dict] = None,
+    ) -> Optional[int]:
+        """
+        Отправляет текстовое сообщение в беседу или конкретный чат (с разбивкой на части при > 4000 символов).
+        Возвращает message_id последнего отправленного сообщения или None при ошибке.
+        """
+        chat_id = str(target_chat_id) if target_chat_id else self.chat_id
+        if not chat_id or chat_id == "YOUR_TELEGRAM_CHAT_ID":
+            logger.error("TELEGRAM_CHAT_ID не задан!")
+            return None
 
         chunks = self._chunk_text(text, max_len=4000)
-        success = True
+        last_message_id = None
 
-        for chunk in chunks:
+        for i, chunk in enumerate(chunks):
             payload = {
-                "chat_id": self.chat_id,
+                "chat_id": chat_id,
                 "text": chunk,
             }
             if parse_mode:
                 payload["parse_mode"] = parse_mode
+            # Кнопки прикрепляем к последнему сообщению
+            if reply_markup and i == len(chunks) - 1:
+                payload["reply_markup"] = reply_markup
 
             try:
                 resp = await self._client.post(f"{self.api_url}/sendMessage", json=payload)
@@ -93,14 +106,107 @@ class TelegramSender:
                         payload["text"] = re.sub(r"<[^>]+>", "", chunk)
                         resp = await self._client.post(f"{self.api_url}/sendMessage", json=payload)
 
-                    if resp.status_code != 200:
-                        logger.error("Ошибка отправки в Telegram: %d %s", resp.status_code, resp.text)
-                        success = False
+                if resp.status_code == 200:
+                    last_message_id = resp.json().get("result", {}).get("message_id")
+                else:
+                    logger.error("Ошибка отправки в Telegram: %d %s", resp.status_code, resp.text)
             except Exception as e:
                 logger.error("Исключение при отправке сообщения в TG: %s", e)
-                success = False
 
-        return success
+        return last_message_id
+
+    async def delete_message(self, chat_id: int | str, message_id: int) -> bool:
+        """Удаляет сообщение в чате"""
+        try:
+            resp = await self._client.post(
+                f"{self.api_url}/deleteMessage",
+                json={"chat_id": str(chat_id), "message_id": message_id},
+            )
+            return resp.status_code == 200 and resp.json().get("ok", False)
+        except Exception:
+            return False
+
+    async def get_updates(self, offset: Optional[int] = None, timeout: int = 5) -> list[dict[str, Any]]:
+        """Получить входящие обновления (команды пользователей)"""
+        params = {"timeout": timeout}
+        if offset is not None:
+            params["offset"] = offset
+
+        try:
+            resp = await self._client.get(f"{self.api_url}/getUpdates", params=params, timeout=float(timeout + 5))
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("result", [])
+        except Exception:
+            pass
+        return []
+
+    async def edit_message_text(
+        self,
+        chat_id: int | str,
+        message_id: int,
+        text: str,
+        parse_mode: Optional[str] = "HTML",
+        reply_markup: Optional[dict] = None,
+    ) -> bool:
+        """Редактирует текст существующего сообщения с кнопками"""
+        payload = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+        }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+
+        try:
+            resp = await self._client.post(f"{self.api_url}/editMessageText", json=payload)
+            if resp.status_code == 200:
+                return True
+            # Игнорируем ошибку Telegram "message is not modified", если нажали на уже выбранный день
+            if "message is not modified" in resp.text:
+                return True
+            logger.error("Ошибка editMessageText: %d %s", resp.status_code, resp.text)
+        except Exception as e:
+            logger.error("Исключение при editMessageText: %s", e)
+        return False
+
+    async def answer_callback_query(self, callback_query_id: str, text: Optional[str] = None) -> bool:
+        """Подтверждает получение callback_query от инлайн-кнопки"""
+        payload = {"callback_query_id": callback_query_id}
+        if text:
+            payload["text"] = text
+        try:
+            resp = await self._client.post(f"{self.api_url}/answerCallbackQuery", json=payload)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    async def send_sticker(
+        self,
+        target_chat_id: str | int,
+        sticker_path: str,
+        reply_markup: Optional[dict] = None,
+    ) -> bool:
+        """Отправляет локальный стикер (.webp)"""
+        try:
+            with open(sticker_path, "rb") as f:
+                sticker_bytes = f.read()
+
+            data = {"chat_id": str(target_chat_id)}
+            if reply_markup:
+                import json
+                data["reply_markup"] = json.dumps(reply_markup)
+
+            files = {"sticker": ("sticker.webp", sticker_bytes, "image/webp")}
+            resp = await self._client.post(f"{self.api_url}/sendSticker", data=data, files=files)
+            if resp.status_code == 200:
+                return True
+            logger.error("Ошибка отправки стикера: %d %s", resp.status_code, resp.text)
+        except Exception as e:
+            logger.error("Исключение при отправке стикера: %s", e)
+        return False
 
     async def send_photo(self, photo_url: str, caption: str = "") -> bool:
         """Отправляет фото по URL"""

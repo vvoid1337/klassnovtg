@@ -9,14 +9,46 @@ from typing import Any
 from config import Config
 from db import Database
 from klassno_client import KlassnoClient
+from journal_client import JournalClient
 from tg_sender import TelegramSender
+from telegram_bot import TelegramBotHandler
 
-# Настройка красивого логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+# Настройка цветного логирования
+class ColoredFormatter(logging.Formatter):
+    COLORS = {
+        "DEBUG": "\033[36m",     # Голубой
+        "INFO": "\033[32m",      # Зеленый
+        "WARNING": "\033[33m",   # Желтый
+        "ERROR": "\033[31m",     # Красный
+        "CRITICAL": "\033[35m",   # Пурпурный
+    }
+    RESET = "\033[0m"
+
+    def format(self, record: logging.LogRecord) -> str:
+        orig_levelname = record.levelname
+        color = self.COLORS.get(orig_levelname, "")
+        record.levelname = f"{color}{orig_levelname:<5}{self.RESET}"
+        formatted = super().format(record)
+        record.levelname = orig_levelname
+        return formatted
+
+
+log_level = getattr(logging, Config.LOG_LEVEL, logging.INFO)
+log_handler = logging.StreamHandler(sys.stdout)
+log_handler.setFormatter(
+    ColoredFormatter(
+        fmt="%(asctime)s | %(levelname)s | %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
 )
+
+logging.basicConfig(level=log_level, handlers=[log_handler])
+
+# Заглушаем болтливые сторонние библиотеки
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("asyncio").setLevel(logging.WARNING)
+
 logger = logging.getLogger("main")
 
 MSK_TZ = timezone(timedelta(hours=3))
@@ -43,6 +75,34 @@ def calculate_sleep_interval(base_interval: int) -> float:
 async def main():
     logger.info("=== Запуск Klassno -> Telegram Forwarder ===")
 
+    # Флаг для корректной остановки
+    stop_event = asyncio.Event()
+
+    def handle_exit():
+        logger.info("Получен сигнал завершения работы...")
+        stop_event.set()
+
+    # Для Windows и Linux
+    try:
+        loop = asyncio.get_running_loop()
+
+        # Глушим известный баг Windows asyncio ProactorEventLoop (WinError 10054 при разрыве соединений)
+        def _asyncio_exception_handler(current_loop, context):
+            exc = context.get("exception")
+            if isinstance(exc, ConnectionResetError) and getattr(exc, "winerror", None) == 10054:
+                return
+            current_loop.default_exception_handler(context)
+
+        loop.set_exception_handler(_asyncio_exception_handler)
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, handle_exit)
+            except NotImplementedError:
+                pass
+    except Exception:
+        pass
+
     # 1. Валидация настроек
     if not Config.KLASSNO_LOGIN or not Config.KLASSNO_PASSWORD:
         logger.error("ОШИБКА: Заполните KLASSNO_LOGIN и KLASSNO_PASSWORD в файле .env!")
@@ -64,12 +124,26 @@ async def main():
     # 2. Инициализация базы данных и клиентов
     db = Database(Config.DB_PATH)
     klassno = KlassnoClient(Config.KLASSNO_LOGIN, Config.KLASSNO_PASSWORD, db)
+    journal = JournalClient(Config.KLASSNO_LOGIN, Config.KLASSNO_PASSWORD)
     tg = TelegramSender(Config.TELEGRAM_BOT_TOKEN, Config.TELEGRAM_CHAT_ID)
+    bot_handler = TelegramBotHandler(tg, journal, db)
 
     if has_tg_creds:
         tg_ok = await tg.check_bot()
         if not tg_ok:
             logger.warning("Не удалось проверить Telegram бота. Проверьте токен.")
+
+    # Фоновая задача: слушаем входящие команды Telegram в личке (расписание)
+    async def telegram_updates_worker():
+        while not stop_event.is_set():
+            try:
+                if has_tg_creds:
+                    await bot_handler.poll_and_handle_updates()
+            except Exception as e:
+                logger.error("Ошибка при обработке команд Telegram: %s", e)
+            await asyncio.sleep(0.2)
+
+    tg_task = asyncio.create_task(telegram_updates_worker())
 
     # 3. Авторизация в Klassno
     auth_ok = await klassno.authenticate()
@@ -115,24 +189,6 @@ async def main():
         else:
             logger.info("Чат '%s' (ID %d) готов. Последний обработанный ID: %d", th_name, th_id, last_id)
 
-    # Флаг для корректной остановки
-    stop_event = asyncio.Event()
-
-    def handle_exit():
-        logger.info("Получен сигнал завершения работы...")
-        stop_event.set()
-
-    # Для Windows и Linux
-    try:
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(sig, handle_exit)
-            except NotImplementedError:
-                pass
-    except Exception:
-        pass
-
     logger.info("Цикл опроса запущен. Интервал: %d сек. Нажмите Ctrl+C для выхода.", Config.POLL_INTERVAL_SECONDS)
 
     try:
@@ -153,8 +209,16 @@ async def main():
     except (KeyboardInterrupt, SystemExit):
         logger.info("Остановка по требованию пользователя...")
     finally:
+        tg_task.cancel()
+        try:
+            await tg_task
+        except asyncio.CancelledError:
+            pass
         await klassno.close()
+        await journal.close()
         await tg.close()
+        # Даем event loop закрыть оставшиеся сетевые транспорты httpx
+        await asyncio.sleep(0.05)
         logger.info("Бот корректно остановлен.")
 
 
