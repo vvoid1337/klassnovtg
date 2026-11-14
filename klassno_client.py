@@ -28,7 +28,7 @@ class KlassnoClient:
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
                 "Accept": "application/ld+json",
             },
-            timeout=15.0,
+            timeout=30.0,
         )
 
     async def close(self):
@@ -86,32 +86,48 @@ class KlassnoClient:
                 logger.info("Срок действия токена истекает, повторный логин...")
                 await self.authenticate()
 
-    async def request(self, method: str, path: str, **kwargs) -> httpx.Response:
-        """Обёртка над запросом с автоматической авторизацией и ретраем при 401"""
+    async def request(self, method: str, path: str, retries: int = 2, **kwargs) -> Optional[httpx.Response]:
+        """Обёртка над запросом с автоматической авторизацией, ретраями и защитой от таймаутов"""
         await self._ensure_token()
 
         headers = kwargs.pop("headers", {})
         if self.access_token:
             headers["Authorization"] = f"Bearer {self.access_token}"
 
-        resp = await self._client.request(method, path, headers=headers, **kwargs)
-
-        # Если 401 Unauthorized — пробуем перелогиниться один раз
-        if resp.status_code == 401:
-            logger.warning("Получен 401 Unauthorized. Пробуем переавторизоваться...")
-            if await self.authenticate():
-                headers["Authorization"] = f"Bearer {self.access_token}"
+        for attempt in range(retries + 1):
+            try:
                 resp = await self._client.request(method, path, headers=headers, **kwargs)
 
-        return resp
+                # Если 401 Unauthorized — пробуем перелогиниться один раз
+                if resp.status_code == 401:
+                    logger.warning("Получен 401 Unauthorized. Пробуем переавторизоваться...")
+                    if await self.authenticate():
+                        headers["Authorization"] = f"Bearer {self.access_token}"
+                        resp = await self._client.request(method, path, headers=headers, **kwargs)
+
+                return resp
+
+            except (httpx.TimeoutException, httpx.NetworkError) as e:
+                if attempt < retries:
+                    logger.warning("Сетевой сбой при запросе к %s (%s). Повтор через 2 сек...", path, type(e).__name__)
+                    await asyncio.sleep(2.0)
+                else:
+                    logger.error("Не удалось выполнить запрос к %s после %d попыток: %s", path, retries + 1, e)
+                    return None
+            except Exception as e:
+                logger.error("Неожиданная ошибка запроса к %s: %s", path, e)
+                return None
+
+        return None
 
     async def get_threads(self) -> list[dict[str, Any]]:
         """Получить список всех доступных чатов студента"""
         resp = await self.request("GET", "/threads")
-        if resp.status_code == 200:
+        if resp is not None and resp.status_code == 200:
             data = resp.json()
             return data.get("hydra:member", [])
-        logger.error("Ошибка при получении списка чатов: %d %s", resp.status_code, resp.text)
+        if resp is not None:
+            logger.error("Ошибка при получении списка чатов: %d %s", resp.status_code, resp.text)
         return []
 
     async def get_thread_name(self, thread_id: int) -> str:
@@ -122,7 +138,7 @@ class KlassnoClient:
 
         resp = await self.request("GET", f"/threads/{thread_id}")
         name = f"Чат #{thread_id}"
-        if resp.status_code == 200:
+        if resp is not None and resp.status_code == 200:
             data = resp.json()
             title = data.get("name") or data.get("title")
             if title:
@@ -142,11 +158,12 @@ class KlassnoClient:
             url = f"/threads/{thread_id}/messages?order[id]=desc&page=1"
 
         resp = await self.request("GET", url)
-        if resp.status_code == 200:
+        if resp is not None and resp.status_code == 200:
             data = resp.json()
             return data.get("hydra:member", [])
 
-        logger.error("Ошибка получения сообщений треда %d: %d %s", thread_id, resp.status_code, resp.text)
+        if resp is not None:
+            logger.error("Ошибка получения сообщений треда %d: %d %s", thread_id, resp.status_code, resp.text)
         return []
 
     async def get_user_name(self, user_iri_or_id: str | int) -> str:
@@ -168,7 +185,7 @@ class KlassnoClient:
 
         # Запрашиваем информацию о пользователе
         resp = await self.request("GET", f"/users/{user_id}")
-        if resp.status_code != 200:
+        if resp is None or resp.status_code != 200:
             return f"Пользователь #{user_id}"
 
         user_data = resp.json()
@@ -178,7 +195,7 @@ class KlassnoClient:
         if ep_iri:
             # ep_iri может быть '/teachers/120628' или '/students/105848'
             resp_ep = await self.request("GET", ep_iri)
-            if resp_ep.status_code == 200:
+            if resp_ep is not None and resp_ep.status_code == 200:
                 ep_data = resp_ep.json()
                 first = ep_data.get("firstName") or ""
                 last = ep_data.get("lastName") or ""
@@ -199,7 +216,7 @@ class KlassnoClient:
                 path = f"/{path}"
 
         resp = await self.request("GET", path)
-        if resp.status_code == 200:
+        if resp is not None and resp.status_code == 200:
             return resp.json()
         return None
 
