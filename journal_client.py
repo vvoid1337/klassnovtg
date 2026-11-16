@@ -44,6 +44,8 @@ class JournalClient:
         self.password = password
         self.access_token: Optional[str] = None
         self.token_expires_at: Optional[datetime] = None
+        self._auth_fail_count: int = 0
+        self._auth_retry_after: float = 0.0
         self._cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 
         self._client = httpx.AsyncClient(
@@ -54,14 +56,62 @@ class JournalClient:
                 "Referer": "https://journal.top-academy.ru/",
                 "Accept": "application/json, text/plain, */*",
             },
-            timeout=30.0,
+            timeout=httpx.Timeout(
+                connect=5.0,
+                read=25.0,
+                write=10.0,
+                pool=5.0,
+            ),
+            limits=httpx.Limits(
+                max_keepalive_connections=5,
+                max_connections=10,
+                keepalive_expiry=30.0,
+            ),
         )
 
     async def close(self):
         await self._client.aclose()
 
+    @staticmethod
+    def _safe_json(resp: Optional[httpx.Response]) -> Optional[Any]:
+        """Безопасное извлечение JSON из ответа сервера"""
+        if resp is None:
+            return None
+        content = resp.content
+        if not content or not content.strip():
+            logger.warning("Получен пустой ответ от журнала (HTTP %s, 0 байт)", resp.status_code)
+            return None
+        try:
+            return resp.json()
+        except Exception as e:
+            logger.warning(
+                "Ошибка декодирования JSON журнала (HTTP %s, длина %d байт): %r",
+                resp.status_code,
+                len(content),
+                e,
+            )
+            return None
+
+    def _record_auth_failure(self, reason: str):
+        """Регистрирует сбой авторизации в журнале с экспоненциальным бэкоффом"""
+        self._auth_fail_count += 1
+        delay = min(15 * (2 ** (self._auth_fail_count - 1)), 300)
+        self._auth_retry_after = time.monotonic() + delay
+        logger.warning(
+            "Неудачная авторизация в журнале #%d (%s). Повтор не ранее чем через %d сек.",
+            self._auth_fail_count,
+            reason,
+            delay,
+        )
+
     async def authenticate(self) -> bool:
         """Авторизация в msapi.top-academy.ru"""
+        now_mono = time.monotonic()
+        if now_mono < self._auth_retry_after:
+            wait_left = int(self._auth_retry_after - now_mono)
+            logger.warning("Авторизация в журнале отложена: кулдаун ещё %d сек.", wait_left)
+            return False
+
         logger.info("Авторизация в журнале (msapi.top-academy.ru)...")
         payload = {
             "application_key": self.APP_KEY,
@@ -73,29 +123,46 @@ class JournalClient:
         try:
             resp = await self._client.post("/api/v2/auth/login", json=payload)
             if resp.status_code == 200:
-                data = resp.json()
+                data = self._safe_json(resp)
+                if not data or not isinstance(data, dict):
+                    self._record_auth_failure("пустой или некорректный JSON")
+                    return False
+
                 self.access_token = data.get("access_token")
                 exp_ts = data.get("expires_in_access")
                 if exp_ts:
                     self.token_expires_at = datetime.fromtimestamp(exp_ts, tz=timezone.utc)
+
+                self._auth_fail_count = 0
+                self._auth_retry_after = 0.0
+
                 logger.info("Успешная авторизация в журнале Top Academy!")
                 return True
             else:
-                logger.error("Ошибка авторизации в журнале: %d %s", resp.status_code, resp.text)
+                body_sample = re.sub(r"\s+", " ", resp.text[:200]).strip()
+                logger.error("Ошибка авторизации в журнале: %d %s", resp.status_code, body_sample)
+                self._record_auth_failure(f"HTTP {resp.status_code}")
                 return False
         except Exception as e:
-            logger.error("Исключение при авторизации в журнале: %s", e)
+            logger.error("Исключение при авторизации в журнале: %r", e, exc_info=True)
+            self._record_auth_failure(type(e).__name__)
             return False
 
-    async def _ensure_token(self):
-        if not self.access_token:
-            await self.authenticate()
-            return
+    async def _ensure_token(self) -> bool:
+        now_utc = datetime.now(timezone.utc)
+        now_mono = time.monotonic()
 
-        if self.token_expires_at:
-            now_utc = datetime.now(timezone.utc)
-            if (self.token_expires_at - now_utc).total_seconds() < 60:
-                await self.authenticate()
+        if self.access_token:
+            if not self.token_expires_at:
+                return True
+            if (self.token_expires_at - now_utc).total_seconds() >= 60:
+                return True
+            logger.info("Срок действия токена журнала истекает, повторный логин...")
+
+        if now_mono < self._auth_retry_after:
+            return False
+
+        return await self.authenticate()
 
     async def get_month_schedule(self, date_filter: str) -> list[dict[str, Any]]:
         """Получить расписание на месяц (с кэшированием в памяти на 10 минут)"""
@@ -106,7 +173,10 @@ class JournalClient:
             if now - cached_time < self.CACHE_TTL_SECONDS:
                 return cached_data
 
-        await self._ensure_token()
+        has_token = await self._ensure_token()
+        if not has_token and not self.access_token:
+            return []
+
         headers = {}
         if self.access_token:
             headers["Authorization"] = f"Bearer {self.access_token}"
@@ -119,6 +189,7 @@ class JournalClient:
                 )
                 if resp.status_code == 401:
                     logger.warning("Токен журнала истек (401), перелогиниваемся...")
+                    self.access_token = None
                     if await self.authenticate():
                         headers["Authorization"] = f"Bearer {self.access_token}"
                         resp = await self._client.get(
@@ -126,16 +197,17 @@ class JournalClient:
                             headers=headers,
                         )
                 if resp.status_code == 200:
-                    data = resp.json()
+                    data = self._safe_json(resp)
                     res_list = data if isinstance(data, list) else []
                     self._cache[month_key] = (now, res_list)
                     return res_list
-                logger.error("Ошибка получения расписания: %d %s", resp.status_code, resp.text)
+                body_sample = re.sub(r"\s+", " ", resp.text[:200]).strip()
+                logger.error("Ошибка получения расписания: %d %s", resp.status_code, body_sample)
             except (httpx.TimeoutException, httpx.NetworkError) as e:
                 logger.warning("Сетевая задержка при получении расписания (%s), повтор...", type(e).__name__)
                 await asyncio.sleep(2.0)
             except Exception as e:
-                logger.error("Неожиданная ошибка получения расписания: %s", e)
+                logger.error("Неожиданная ошибка получения расписания: %r", e, exc_info=True)
                 break
 
         return []

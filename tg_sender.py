@@ -42,10 +42,25 @@ class TelegramSender:
         self.bot_token = bot_token
         self.chat_id = chat_id
         self.api_url = f"https://api.telegram.org/bot{self.bot_token}"
-        self._client = httpx.AsyncClient(timeout=20.0)
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=5.0, read=20.0, write=10.0, pool=5.0),
+            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10, keepalive_expiry=30.0),
+        )
 
     async def close(self):
         await self._client.aclose()
+
+    @staticmethod
+    def _safe_json(resp: Optional[httpx.Response]) -> Optional[Any]:
+        if resp is None:
+            return None
+        content = resp.content
+        if not content or not content.strip():
+            return None
+        try:
+            return resp.json()
+        except Exception:
+            return None
 
     async def check_bot(self) -> bool:
         """Проверяет токен бота (getMe)"""
@@ -55,15 +70,17 @@ class TelegramSender:
 
         try:
             resp = await self._client.get(f"{self.api_url}/getMe")
-            if resp.status_code == 200 and resp.json().get("ok"):
-                bot_user = resp.json()["result"].get("username")
+            data = self._safe_json(resp)
+            if resp.status_code == 200 and isinstance(data, dict) and data.get("ok"):
+                bot_user = data.get("result", {}).get("username")
                 logger.info("Telegram бот успешно подключен: @%s", bot_user)
                 return True
             else:
-                logger.error("Неверный токен Telegram бота: %s", resp.text)
+                body_sample = re.sub(r"\s+", " ", resp.text[:200]).strip() if resp else "No response"
+                logger.error("Неверный токен Telegram бота: %s", body_sample)
                 return False
         except Exception as e:
-            logger.error("Ошибка соединения с Telegram API: %s", e)
+            logger.error("Ошибка соединения с Telegram API: %r", e, exc_info=True)
             return False
 
     async def send_text(
@@ -107,11 +124,13 @@ class TelegramSender:
                         resp = await self._client.post(f"{self.api_url}/sendMessage", json=payload)
 
                 if resp.status_code == 200:
-                    last_message_id = resp.json().get("result", {}).get("message_id")
+                    data = self._safe_json(resp)
+                    if isinstance(data, dict):
+                        last_message_id = data.get("result", {}).get("message_id")
                 else:
                     logger.error("Ошибка отправки в Telegram: %d %s", resp.status_code, resp.text)
             except Exception as e:
-                logger.error("Исключение при отправке сообщения в TG: %s", e)
+                logger.error("Исключение при отправке сообщения в TG: %r", e, exc_info=True)
 
         return last_message_id
 
@@ -122,7 +141,8 @@ class TelegramSender:
                 f"{self.api_url}/deleteMessage",
                 json={"chat_id": str(chat_id), "message_id": message_id},
             )
-            return resp.status_code == 200 and resp.json().get("ok", False)
+            data = self._safe_json(resp)
+            return resp.status_code == 200 and isinstance(data, dict) and data.get("ok", False)
         except Exception:
             return False
 
@@ -135,8 +155,9 @@ class TelegramSender:
         try:
             resp = await self._client.get(f"{self.api_url}/getUpdates", params=params, timeout=float(timeout + 5))
             if resp.status_code == 200:
-                data = resp.json()
-                return data.get("result", [])
+                data = self._safe_json(resp)
+                if isinstance(data, dict):
+                    return data.get("result", [])
         except Exception:
             pass
         return []
